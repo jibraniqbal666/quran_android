@@ -20,10 +20,10 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewGroup.MarginLayoutParams
 import android.widget.ArrayAdapter
 import android.widget.FrameLayout
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -31,8 +31,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SearchView
 import androidx.appcompat.widget.Toolbar
 import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.updatePadding
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -141,7 +144,7 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.shareIn
@@ -194,12 +197,14 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
   private lateinit var translationsSpinner: QuranSpinner
   private lateinit var overlay: FrameLayout
   private lateinit var toolBarArea: View
-  private lateinit var audioBarParams: MarginLayoutParams
 
   private var requestPermissionLauncher: ActivityResultLauncher<String>? = null
 
-  private var defaultNavigationBarColor = 0
   private var isSplitScreen = false
+
+  private lateinit var onClearAyahModeBackCallback: OnBackPressedCallback
+  private lateinit var onShowingTranslationBackCallback: OnBackPressedCallback
+  private lateinit var onEndSessionBackCallback: OnBackPressedCallback
 
   private var lastSelectedTranslationAyah: QuranAyahInfo? = null
   private var lastActivatedLocalTranslations: Array<LocalTranslation> = emptyArray()
@@ -230,6 +235,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
 
   private lateinit var audioStatusRepositoryBridge: AudioStatusRepositoryBridge
   private lateinit var readingEventPresenterBridge: ReadingEventPresenterBridge
+  private lateinit var windowInsetsController: WindowInsetsControllerCompat
 
   private var translationJob: Job? = null
   private lateinit var compositeDisposable: CompositeDisposable
@@ -265,6 +271,8 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
   public override fun onCreate(savedInstanceState: Bundle?) {
     val quranApp = application as QuranApplication
     quranApp.refreshLocale(this, false)
+
+    WindowCompat.setDecorFitsSystemWindows(window, false)
     super.onCreate(savedInstanceState)
 
     // field injection
@@ -278,19 +286,32 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
         WindowInfoTracker.getOrCreate(this@PagerActivity)
           .windowLayoutInfo(this@PagerActivity)
-          .mapNotNull { it.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull() }
-          .collectLatest { foldingFeatures ->
-            val localState = foldingFeatures.state == FoldingFeature.State.FLAT &&
-                foldingFeatures.orientation == FoldingFeature.Orientation.VERTICAL
-            if (isFoldableDeviceOpenAndVertical != localState) {
-              isFoldableDeviceOpenAndVertical = localState
-              initialize(savedInstanceState)
+          .map { it.displayFeatures }
+          .collectLatest {
+            val foldingFeatures = it.filterIsInstance<FoldingFeature>().firstOrNull()
+            if (foldingFeatures != null) {
+              val localState = foldingFeatures.state == FoldingFeature.State.FLAT &&
+                  foldingFeatures.orientation == FoldingFeature.Orientation.VERTICAL
+              if (isFoldableDeviceOpenAndVertical != localState) {
+                isFoldableDeviceOpenAndVertical = localState
+                updateDualPageMode()
+              }
+            } else if (isFoldableDeviceOpenAndVertical) {
+              // this else case suggests that the device is not open and vertical, otherwise
+              // we'd have some information given via the folding features.
+              isFoldableDeviceOpenAndVertical = false
+              updateDualPageMode()
             }
           }
       }
     }
 
     setContentView(R.layout.quran_page_activity_slider)
+
+    windowInsetsController = WindowInsetsControllerCompat(
+      window, findViewById<ViewGroup>(R.id.sliding_panel)
+    )
+    registerBackPressedCallbacks()
     initialize(savedInstanceState)
     requestPermissionLauncher =
       registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean? ->
@@ -318,6 +339,34 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
     }.launchIn(scope)
   }
 
+  private fun updateDualPageMode() {
+    val lastIsDualPages = isDualPages
+    isDualPages = QuranUtils.isDualPages(this, quranScreenInfo, isFoldableDeviceOpenAndVertical)
+    if (lastIsDualPages != isDualPages) {
+      val page = currentPage
+
+      pagerAdapter = QuranPageAdapter(
+        supportFragmentManager,
+        isDualPages,
+        showingTranslation,
+        quranInfo,
+        isSplitScreen,
+        pageProviderFactoryProvider.providePageViewFactory(quranSettings.pageType)
+      )
+      viewPager.adapter = pagerAdapter
+      // when going from two page per screen to one or vice versa, we adjust the page number,
+      // such that the first page is always selected.
+      val curPage = if (isDualPageVisible) {
+        quranInfo.mapSinglePageToDualPage(page)
+      } else {
+        quranInfo.mapDualPageToSinglePage(page)
+      }
+
+      val pageIndex = quranInfo.getPositionFromPage(curPage, isDualPageVisible)
+      viewPager.setCurrentItem(pageIndex)
+    }
+  }
+
   private fun initialize(savedInstanceState: Bundle?) {
     var shouldAdjustPageNumber = false
     isDualPages = QuranUtils.isDualPages(this, quranScreenInfo, isFoldableDeviceOpenAndVertical)
@@ -336,7 +385,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       {
         onPageClicked()
       },
-      { ayahSelection: AyahSelection ->
+      handleSelection = { ayahSelection: AyahSelection ->
         onAyahSelectionChanged(ayahSelection)
       }
     )
@@ -377,25 +426,27 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
         }
       }
     }
+    onShowingTranslationBackCallback.isEnabled = showingTranslation
 
     compositeDisposable = CompositeDisposable()
 
     audioStatusBar = findViewById(R.id.audio_area)
-    audioBarParams = audioStatusBar.layoutParams as MarginLayoutParams
 
     toolBarArea = findViewById(R.id.toolbar_area)
     translationsSpinner = findViewById(R.id.spinner)
     overlay = findViewById(R.id.overlay)
 
-    // this is the colored view behind the status bar on kitkat and above
-    val statusBarBackground = findViewById<View>(R.id.status_bg)
-    statusBarBackground.layoutParams.height = statusBarHeight
+    ViewCompat.setOnApplyWindowInsetsListener(toolBarArea) { view, windowInsets ->
+      val insets = windowInsets.getInsets(
+        WindowInsetsCompat.Type.statusBars() or
+            WindowInsetsCompat.Type.displayCutout() or
+            WindowInsetsCompat.Type.navigationBars()
+      )
+      view.updatePadding(insets.left, insets.top, insets.right, 0)
+      windowInsets
+    }
 
     val toolbar = findViewById<Toolbar>(R.id.toolbar)
-    if (quranSettings.isArabicNames || QuranUtils.isRtl()) {
-      // remove when we remove LTR from quran_page_activity's root
-      ViewCompat.setLayoutDirection(toolbar, ViewCompat.LAYOUT_DIRECTION_RTL)
-    }
     setSupportActionBar(toolbar)
 
     supportActionBar?.setDisplayShowHomeEnabled(true)
@@ -541,8 +592,6 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       }
     }
 
-    defaultNavigationBarColor = window.navigationBarColor
-
     quranEventLogger.logAnalytics(isDualPages, showingTranslation, isSplitScreen)
 
     // Setup recitation (if enabled)
@@ -554,6 +603,30 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
         { ayah: SuraAyah -> ensurePage(ayah.sura, ayah.ayah) },
         { sliderPage: Int -> showSlider(slidingPagerAdapter.getPagePosition(sliderPage)) }
       ))
+  }
+
+  private fun registerBackPressedCallbacks() {
+    val isSessionEnabled = false
+    onEndSessionBackCallback = object : OnBackPressedCallback(isSessionEnabled) {
+      override fun handleOnBackPressed() {
+        onSessionEnd()
+      }
+    }
+    onBackPressedDispatcher.addCallback(this, onEndSessionBackCallback)
+
+    onShowingTranslationBackCallback = object : OnBackPressedCallback(showingTranslation) {
+      override fun handleOnBackPressed() {
+        switchToQuran()
+      }
+    }
+    onBackPressedDispatcher.addCallback(this, onShowingTranslationBackCallback)
+
+    onClearAyahModeBackCallback = object : OnBackPressedCallback(selectionStart != null) {
+      override fun handleOnBackPressed() {
+        endAyahMode()
+      }
+    }
+    onBackPressedDispatcher.addCallback(this, onClearAyahModeBackCallback)
   }
 
   override fun onRequestPermissionsResult(
@@ -585,19 +658,6 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       .onStart { emit(currentPage) }
       .buffer(onBufferOverflow = BufferOverflow.DROP_OLDEST)
       .shareIn(scope, SharingStarted.Eagerly, 1)
-
-  private val statusBarHeight: Int
-    get() {
-      // thanks to https://github.com/jgilfelt/SystemBarTint for this
-      val resources = resources
-      val resId = resources.getIdentifier(
-        "status_bar_height", "dimen", "android"
-      )
-      if (resId > 0) {
-        return resources.getDimensionPixelSize(resId)
-      }
-      return 0
-    }
 
   private fun initAyahActionPanel() {
     slidingPanel = findViewById(R.id.sliding_panel)
@@ -670,8 +730,10 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
     if (haveSelection) {
       val startPosition = startPosition(ayahSelection)
       updateLocalTranslations(startPosition)
+      onClearAyahModeBackCallback.isEnabled = selectionStart != null
     } else {
       endAyahMode()
+      onClearAyahModeBackCallback.isEnabled = false
     }
   }
 
@@ -692,9 +754,26 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
   }
 
   private fun setUiVisibility(isVisible: Boolean) {
-    setUiVisibilityKitKat(isVisible)
-    if (isInMultiWindowMode) {
-      animateToolBar(isVisible)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      setUiVisibilityR(isVisible)
+    } else {
+      setUiVisibilityKitKat(isVisible)
+    }
+  }
+
+  private fun setUiVisibilityR(isVisible: Boolean) {
+    if (isVisible) {
+      windowInsetsController.show(
+        WindowInsetsCompat.Type.statusBars() or
+            WindowInsetsCompat.Type.navigationBars()
+      )
+    } else {
+      windowInsetsController.hide(
+        WindowInsetsCompat.Type.statusBars() or
+            WindowInsetsCompat.Type.navigationBars()
+      )
+      windowInsetsController.systemBarsBehavior =
+        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
   }
 
@@ -709,12 +788,32 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
           or View.SYSTEM_UI_FLAG_IMMERSIVE)
     }
     viewPager.systemUiVisibility = flags
+
+    if (isInMultiWindowMode) {
+      animateToolBar(isVisible)
+    }
   }
 
   private fun setUiVisibilityListener() {
-    viewPager.setOnSystemUiVisibilityChangeListener { flags: Int ->
-      val visible = (flags and View.SYSTEM_UI_FLAG_FULLSCREEN) == 0
-      animateToolBar(visible)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { _, insets ->
+        val isStatusBarVisible = insets.isVisible(WindowInsetsCompat.Type.statusBars())
+        // on devices with "hide full screen indicator" or "hide the bottom bar,"
+        // this always returns false, which causes the touches to not work.
+        val isNavigationBarVisible = insets.isVisible(WindowInsetsCompat.Type.navigationBars())
+
+        // as a fix for the aforementioned point, make either one's visibility suggest
+        // visibility (instead of requiring both to agree).
+        val isVisible = isStatusBarVisible || isNavigationBarVisible
+
+        animateToolBar(isVisible)
+        insets
+      }
+    } else {
+      viewPager.setOnSystemUiVisibilityChangeListener { flags: Int ->
+        val visible = (flags and View.SYSTEM_UI_FLAG_FULLSCREEN) == 0
+        animateToolBar(visible)
+      }
     }
   }
 
@@ -731,13 +830,9 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       .setDuration(250)
       .start()
 
-    // the bottom margin on the audio bar is not part of its height, and so we have to
-    // take it into account when animating the audio bar off the screen.
-    val bottomMargin = audioBarParams.bottomMargin
-
     // and audio bar
     audioStatusBar.animate()
-      .translationY((if (visible) 0 else audioStatusBar.height + bottomMargin).toFloat())
+      .translationY((if (visible) 0 else audioStatusBar.height).toFloat())
       .setDuration(250)
       .start()
   }
@@ -770,7 +865,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
     audioPresenter.bind(this)
     recentPagePresenter.bind(currentPageFlow)
     isInMultiWindowMode =
-      Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInMultiWindowMode()
+      Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInMultiWindowMode
 
     if (shouldReconnect) {
       foregroundDisposable.add(
@@ -790,17 +885,6 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
             shouldReconnect = false
           })
     }
-
-    updateNavigationBar(quranSettings.isNightMode)
-  }
-
-  private fun updateNavigationBar(isNightMode: Boolean) {
-    val color =
-      if (isNightMode) ContextCompat.getColor(
-        this,
-        R.color.navbar_night_color
-      ) else defaultNavigationBarColor
-    window.navigationBarColor = color
   }
 
   override fun inject(audioBarWrapper: AudioBarWrapper) {
@@ -937,9 +1021,11 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
         if (showingTranslation) {
           pagerAdapter.setTranslationMode()
           updateActionBarSpinner()
+          onShowingTranslationBackCallback.isEnabled = true
         } else {
           pagerAdapter.setQuranMode()
           updateActionBarTitle(page)
+          onShowingTranslationBackCallback.isEnabled = false
         }
 
         supportInvalidateOptionsMenu()
@@ -1006,6 +1092,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
   }
 
   private fun onSessionEnd() {
+    onEndSessionBackCallback.isEnabled = false
     pagerActivityRecitationPresenter.onSessionEnd()
   }
 
@@ -1087,9 +1174,8 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       val isNightMode = !item.isChecked
       prefsEditor.putBoolean(Constants.PREF_NIGHT_MODE, isNightMode).apply()
       item.setIcon(if (isNightMode) R.drawable.ic_night_mode else R.drawable.ic_day_mode)
-      item.setChecked(isNightMode)
+      item.isChecked = isNightMode
       refreshQuranPages()
-      updateNavigationBar(isNightMode)
       return true
     } else if (itemId == R.id.settings) {
       val i = Intent(this, QuranPreferenceActivity::class.java)
@@ -1131,6 +1217,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
     val page = currentPage
     pagerAdapter.setQuranMode()
     showingTranslation = false
+    onShowingTranslationBackCallback.isEnabled = false
     if (shouldUpdatePageNumber()) {
       val position = quranInfo.getPositionFromPage(page, true)
       viewPager.currentItem = position
@@ -1151,6 +1238,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
       val page = currentPage
       pagerAdapter.setTranslationMode()
       showingTranslation = true
+      onShowingTranslationBackCallback.isEnabled = true
       if (shouldUpdatePageNumber()) {
         val position = quranInfo.getPositionFromPage(page, false)
         viewPager.currentItem = position
@@ -1617,17 +1705,6 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
 
   //endregion
 
-  override fun onBackPressed() {
-    if (selectionStart != null) {
-      endAyahMode()
-    } else if (showingTranslation) {
-      switchToQuran()
-    } else {
-      onSessionEnd()
-      super.onBackPressed()
-    }
-  }
-
   private val selectionStart: SuraAyah?
     // region Ayah selection
     get() {
@@ -1696,6 +1773,7 @@ class PagerActivity : AppCompatActivity(), AudioBarListener, OnBookmarkTagsUpdat
         playFromAyah(startSuraAyah.sura, startSuraAyah.ayah)
         toggleActionBarVisibility(true)
       } else if (itemId == com.quran.labs.androidquran.common.toolbar.R.id.cab_recite_from_here) {
+        onEndSessionBackCallback.isEnabled = true
         pagerActivityRecitationPresenter.onRecitationPressed()
       } else if (itemId == com.quran.labs.androidquran.common.toolbar.R.id.cab_share_ayah_link) {
         shareAyahLink(startSuraAyah, endSuraAyah)
